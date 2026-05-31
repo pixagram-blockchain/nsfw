@@ -1,6 +1,6 @@
 {
   "name": "@pixagram/nsfw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "On-device NSFW image classification for the browser (EfficientNet via onnxruntime-web). Off-main-thread Web Worker with an automatic main-thread fallback. Model bundled in the package.",
   "type": "module",
   "license": "Apache-2.0",
@@ -8,6 +8,10 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+   "repository": {
+    "url": "https://github.com/pixagram-blockchain/nsfw.git",
+    "type": "git"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
