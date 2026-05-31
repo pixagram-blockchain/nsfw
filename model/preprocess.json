@@ -1,0 +1,19 @@
+{
+  "size": 224,
+  "cropSize": 289,
+  "doCenterCrop": false,
+  "rescaleFactor": 0.00392156862745098,
+  "rescaleOffset": false,
+  "doNormalize": true,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.47853944,
+    0.4732864,
+    0.47434163
+  ],
+  "includeTop": true
+}
