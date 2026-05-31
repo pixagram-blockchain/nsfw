@@ -23,7 +23,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // src/core.ts
-var ort = __toESM(require("onnxruntime-web/wasm"), 1);
+var ort = __toESM(require("onnxruntime-web/webgpu"), 1);
 function now() {
   return typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
 }
@@ -52,16 +52,34 @@ function configureRuntime(opts = {}) {
 }
 async function loadSession(bytes, opts = {}) {
   configureRuntime(opts);
-  const session2 = await ort.InferenceSession.create(bytes, {
-    executionProviders: ["wasm"],
-    graphOptimizationLevel: "all"
-  });
+  const pref = opts.backend ?? "auto";
+  const hasGPU = typeof navigator !== "undefined" && !!navigator.gpu;
+  const useGPU = pref === "webgpu" || pref === "auto" && hasGPU;
+  const providers = useGPU ? ["webgpu", "wasm"] : ["wasm"];
+  let session2;
+  let used = useGPU ? "webgpu" : "wasm";
+  try {
+    session2 = await ort.InferenceSession.create(bytes, {
+      executionProviders: providers,
+      graphOptimizationLevel: "all"
+    });
+  } catch (e) {
+    if (useGPU && pref !== "webgpu") {
+      session2 = await ort.InferenceSession.create(bytes, {
+        executionProviders: ["wasm"],
+        graphOptimizationLevel: "all"
+      });
+      used = "wasm";
+    } else {
+      throw e;
+    }
+  }
   const inputName = session2.inputNames[0];
   const outputName = session2.outputNames[0];
   if (!inputName || !outputName) {
     throw new Error("@pixagram/nsfw: model has no input/output names");
   }
-  return { session: session2, inputName, outputName };
+  return { session: session2, inputName, outputName, backend: used };
 }
 function resizeToSquare(px, cfg2) {
   const S = cfg2.size;
@@ -172,7 +190,14 @@ async function classifyImageData(sess, px, cfg2, labels2, thresholds2) {
   const output = results[sess.outputName];
   if (!output) throw new Error("@pixagram/nsfw: missing model output");
   const decoded = decode(output.data, labels2, thresholds2);
-  const backend = "wasm" + (ort.env.wasm.simd ? "+simd" : "");
+  const simd = (() => {
+    try {
+      return ort.env.wasm.simd ? "+simd" : "";
+    } catch {
+      return "";
+    }
+  })();
+  const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
   return { ...decoded, ms: Math.round(now() - tStart), backend };
 }
 

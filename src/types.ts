@@ -63,6 +63,8 @@ export type ImageSource =
 export interface DetectorOptions {
   /** "auto" (default) uses a Worker when available, else main-thread. */
   useWorker?: "auto" | boolean;
+  /** Execution provider: "auto" tries WebGPU then WASM (default). */
+  backend?: "auto" | "webgpu" | "wasm";
   /** Where onnxruntime-web's own .wasm/.mjs are served from. */
   wasmPaths?: string | Record<string, string>;
   /** WASM threads. >1 requires cross-origin isolation (COOP/COEP). Default 1. */

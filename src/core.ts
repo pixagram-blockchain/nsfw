@@ -2,7 +2,9 @@
  * core.ts — runtime-agnostic inference helpers shared by the Web Worker and the
  * main-thread fallback. No DOM beyond OffscreenCanvas (available in both).
  */
-import * as ort from "onnxruntime-web/wasm";
+// The /webgpu bundle includes BOTH the WebGPU and WASM execution providers,
+// so we can prefer GPU and fall back to CPU from a single import.
+import * as ort from "onnxruntime-web/webgpu";
 import type { PreprocessConfig, Thresholds, NsfwResult } from "./types.js";
 
 function now(): number {
@@ -22,11 +24,14 @@ export interface Session {
   session: ort.InferenceSession;
   inputName: string;
   outputName: string;
+  backend: string; // the execution provider that actually started, e.g. "webgpu"
 }
 
 export interface RuntimeOptions {
   wasmPaths?: string | Record<string, string>;
   numThreads?: number;
+  /** "auto" tries WebGPU then WASM (default). Force one with "webgpu"/"wasm". */
+  backend?: "auto" | "webgpu" | "wasm";
 }
 
 let configured = false;
@@ -64,16 +69,50 @@ export async function loadSession(
   opts: RuntimeOptions = {}
 ): Promise<Session> {
   configureRuntime(opts);
-  const session = await ort.InferenceSession.create(bytes, {
-    executionProviders: ["wasm"],
-    graphOptimizationLevel: "all",
-  });
+
+  const pref = opts.backend ?? "auto";
+  const hasGPU =
+    typeof navigator !== "undefined" &&
+    !!(navigator as unknown as { gpu?: unknown }).gpu;
+
+  // For the GPU path, pass ["webgpu","wasm"] as ONE provider list. ORT runs each
+  // op on the WebGPU EP when it has a kernel and falls back to CPU per-op
+  // otherwise — within a single session. This is what lets an INT8/QDQ model run
+  // on WebGPU at all: listing "webgpu" alone would fail on any unsupported
+  // quantize/dequantize op and drop the whole model to CPU. Pure "wasm" is used
+  // when the GPU is unwanted or the WebGPU API isn't present.
+  const useGPU = pref === "webgpu" || (pref === "auto" && hasGPU);
+  const providers = useGPU ? ["webgpu", "wasm"] : ["wasm"];
+
+  let session: ort.InferenceSession;
+  let used = useGPU ? "webgpu" : "wasm";
+  try {
+    session = await ort.InferenceSession.create(bytes, {
+      executionProviders: providers,
+      graphOptimizationLevel: "all",
+    });
+  } catch (e) {
+    // WebGPU couldn't initialise at all (no adapter, etc.). If we weren't forced
+    // onto it, retry pure CPU; if the caller forced "webgpu", surface the error.
+    if (useGPU && pref !== "webgpu") {
+      session = await ort.InferenceSession.create(bytes, {
+        executionProviders: ["wasm"],
+        graphOptimizationLevel: "all",
+      });
+      used = "wasm";
+    } else {
+      throw e;
+    }
+  }
+
   const inputName = session.inputNames[0];
   const outputName = session.outputNames[0];
   if (!inputName || !outputName) {
     throw new Error("@pixagram/nsfw: model has no input/output names");
   }
-  return { session, inputName, outputName };
+  // `used` is the PRIMARY provider; with the GPU path some ops may still run on
+  // CPU via fallback. The measured ms is the real signal of how well it landed.
+  return { session, inputName, outputName, backend: used };
 }
 
 /**
@@ -88,7 +127,12 @@ function resizeToSquare(px: PixelData, cfg: PreprocessConfig): Uint8ClampedArray
   const src = new OffscreenCanvas(px.width, px.height);
   const sctx = src.getContext("2d", { willReadFrequently: true });
   if (!sctx) throw new Error("@pixagram/nsfw: 2D canvas context unavailable");
-  sctx.putImageData(new ImageData(px.data, px.width, px.height), 0, 0);
+  // Cast to any: newer TS types Uint8ClampedArray as generic over ArrayBufferLike
+  // (which includes SharedArrayBuffer) and rejects it for ImageData's argument,
+  // though at runtime our buffer is always a plain ArrayBuffer. Type-only, and
+  // `any` keeps this compiling across TS 5.4–5.7+ (the generic form is 5.7-only).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sctx.putImageData(new ImageData(px.data as any, px.width, px.height), 0, 0);
 
   const dst = new OffscreenCanvas(S, S);
   const dctx = dst.getContext("2d", { willReadFrequently: true });
@@ -222,7 +266,14 @@ export async function classifyImageData(
   if (!output) throw new Error("@pixagram/nsfw: missing model output");
 
   const decoded = decode(output.data as Float32Array, labels, thresholds);
-  const backend = "wasm" + (ort.env.wasm.simd ? "+simd" : "");
+  const simd = (() => {
+    try {
+      return ort.env.wasm.simd ? "+simd" : "";
+    } catch {
+      return "";
+    }
+  })();
+  const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
 
   return { ...decoded, ms: Math.round(now() - tStart), backend };
 }

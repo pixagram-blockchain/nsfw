@@ -1,5 +1,5 @@
 // src/core.ts
-import * as ort from "onnxruntime-web/wasm";
+import * as ort from "onnxruntime-web/webgpu";
 function now() {
   return typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
 }
@@ -28,16 +28,34 @@ function configureRuntime(opts = {}) {
 }
 async function loadSession(bytes, opts = {}) {
   configureRuntime(opts);
-  const session = await ort.InferenceSession.create(bytes, {
-    executionProviders: ["wasm"],
-    graphOptimizationLevel: "all"
-  });
+  const pref = opts.backend ?? "auto";
+  const hasGPU = typeof navigator !== "undefined" && !!navigator.gpu;
+  const useGPU = pref === "webgpu" || pref === "auto" && hasGPU;
+  const providers = useGPU ? ["webgpu", "wasm"] : ["wasm"];
+  let session;
+  let used = useGPU ? "webgpu" : "wasm";
+  try {
+    session = await ort.InferenceSession.create(bytes, {
+      executionProviders: providers,
+      graphOptimizationLevel: "all"
+    });
+  } catch (e) {
+    if (useGPU && pref !== "webgpu") {
+      session = await ort.InferenceSession.create(bytes, {
+        executionProviders: ["wasm"],
+        graphOptimizationLevel: "all"
+      });
+      used = "wasm";
+    } else {
+      throw e;
+    }
+  }
   const inputName = session.inputNames[0];
   const outputName = session.outputNames[0];
   if (!inputName || !outputName) {
     throw new Error("@pixagram/nsfw: model has no input/output names");
   }
-  return { session, inputName, outputName };
+  return { session, inputName, outputName, backend: used };
 }
 function resizeToSquare(px, cfg) {
   const S = cfg.size;
@@ -148,7 +166,14 @@ async function classifyImageData(sess, px, cfg, labels, thresholds) {
   const output = results[sess.outputName];
   if (!output) throw new Error("@pixagram/nsfw: missing model output");
   const decoded = decode(output.data, labels, thresholds);
-  const backend = "wasm" + (ort.env.wasm.simd ? "+simd" : "");
+  const simd = (() => {
+    try {
+      return ort.env.wasm.simd ? "+simd" : "";
+    } catch {
+      return "";
+    }
+  })();
+  const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
   return { ...decoded, ms: Math.round(now() - tStart), backend };
 }
 
@@ -252,7 +277,8 @@ var DirectImpl = class _DirectImpl {
   static async create(bytes, cfg, labels, thresholds, opts) {
     const sess = await loadSession(bytes, {
       wasmPaths: opts.wasmPaths,
-      numThreads: opts.numThreads
+      numThreads: opts.numThreads,
+      backend: opts.backend
     });
     return new _DirectImpl(sess, cfg, labels, thresholds);
   }
@@ -300,7 +326,7 @@ var WorkerImpl = class _WorkerImpl {
         cfg,
         labels,
         thresholds,
-        opts: { wasmPaths: opts.wasmPaths, numThreads: opts.numThreads }
+        opts: { wasmPaths: opts.wasmPaths, numThreads: opts.numThreads, backend: opts.backend }
       },
       [buf]
     );

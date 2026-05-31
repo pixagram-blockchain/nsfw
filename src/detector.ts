@@ -105,6 +105,7 @@ class DirectImpl implements Impl {
     const sess = await core.loadSession(bytes, {
       wasmPaths: opts.wasmPaths,
       numThreads: opts.numThreads,
+      backend: opts.backend,
     });
     return new DirectImpl(sess, cfg, labels, thresholds);
   }
@@ -169,7 +170,7 @@ class WorkerImpl implements Impl {
         cfg,
         labels,
         thresholds,
-        opts: { wasmPaths: opts.wasmPaths, numThreads: opts.numThreads },
+        opts: { wasmPaths: opts.wasmPaths, numThreads: opts.numThreads, backend: opts.backend },
       },
       [buf]
     );
