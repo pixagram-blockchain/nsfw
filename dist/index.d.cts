@@ -59,6 +59,10 @@ interface DetectorOptions {
     wasmPaths?: string | Record<string, string>;
     /** WASM threads. >1 requires cross-origin isolation (COOP/COEP). Default 1. */
     numThreads?: number;
+    /** Max images per batched inference call (default 8). */
+    maxBatch?: number;
+    /** Coalescing window in ms: classify() calls within it run as one batch (default 12). */
+    batchDelayMs?: number;
     /** Override the default per-class gates. */
     thresholds?: Partial<Thresholds>;
     /** Provide your own model bytes instead of the embedded one. */

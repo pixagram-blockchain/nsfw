@@ -154,18 +154,25 @@ function decode(logits, labels, t) {
   if (combined >= t.combined) triggers.push("combined>=" + t.combined);
   return { scores, top: { label: topLabel, score: topScore }, nsfw: triggers.length > 0, triggers };
 }
-async function classifyImageData(sess, px, cfg, labels, thresholds) {
+async function classifyBatch(sess, pxs, cfg, labels, thresholds) {
   const tStart = now();
-  const rgba = resizeToSquare(px, cfg);
-  const data = toTensorData(rgba, cfg);
+  const n = pxs.length;
+  if (n === 0) return [];
   const S = cfg.size;
-  const tensor = new ort.Tensor("float32", data, [1, 3, S, S]);
+  const stride = 3 * S * S;
+  const data = new Float32Array(n * stride);
+  for (let i = 0; i < n; i++) {
+    const rgba = resizeToSquare(pxs[i], cfg);
+    data.set(toTensorData(rgba, cfg), i * stride);
+  }
+  const tensor = new ort.Tensor("float32", data, [n, 3, S, S]);
   const feeds = {};
   feeds[sess.inputName] = tensor;
-  const results = await sess.session.run(feeds);
-  const output = results[sess.outputName];
+  const out = await sess.session.run(feeds);
+  const output = out[sess.outputName];
   if (!output) throw new Error("@pixagram/nsfw: missing model output");
-  const decoded = decode(output.data, labels, thresholds);
+  const all = output.data;
+  const classesPerRow = Math.floor(all.length / n);
   const simd = (() => {
     try {
       return ort.env.wasm.simd ? "+simd" : "";
@@ -174,7 +181,14 @@ async function classifyImageData(sess, px, cfg, labels, thresholds) {
     }
   })();
   const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
-  return { ...decoded, ms: Math.round(now() - tStart), backend };
+  const ms = Math.round(now() - tStart);
+  const results = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const logits = all.subarray(i * classesPerRow, (i + 1) * classesPerRow);
+    const decoded = decode(logits, labels, thresholds);
+    results[i] = { ...decoded, ms, backend };
+  }
+  return results;
 }
 
 // src/assets.generated.ts
@@ -267,12 +281,56 @@ async function toPixelData(source) {
   if (bitmap) bitmap.close();
   return { data: id.data, width: w, height: h };
 }
+var DEFAULT_MAX_BATCH = 8;
+var DEFAULT_BATCH_DELAY_MS = 12;
+var Batcher = class {
+  constructor(run, maxBatch, delayMs) {
+    this.run = run;
+    this.maxBatch = maxBatch;
+    this.delayMs = delayMs;
+    this.queue = [];
+    this.timer = null;
+  }
+  submit(px) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ px, resolve, reject });
+      if (this.queue.length >= this.maxBatch) {
+        this.flush();
+      } else if (this.timer === null) {
+        this.timer = setTimeout(() => this.flush(), this.delayMs);
+      }
+    });
+  }
+  flush() {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this.queue.length === 0) return;
+    const batch = this.queue.splice(0, this.maxBatch);
+    this.run(batch.map((b) => b.px)).then((results) => {
+      for (let i = 0; i < batch.length; i++) {
+        const r = results[i];
+        if (r) batch[i].resolve(r);
+        else batch[i].reject(new Error("@pixagram/nsfw: missing batch result"));
+      }
+    }).catch((err) => {
+      const e = err instanceof Error ? err : new Error(String(err));
+      for (const b of batch) b.reject(e);
+    });
+    if (this.queue.length > 0 && this.timer === null) {
+      this.timer = setTimeout(() => this.flush(), this.delayMs);
+    }
+  }
+};
 var DirectImpl = class _DirectImpl {
-  constructor(sess, cfg, labels, thresholds) {
+  constructor(sess, cfg, labels, thresholds, maxBatch, delayMs) {
     this.sess = sess;
-    this.cfg = cfg;
-    this.labels = labels;
-    this.thresholds = thresholds;
+    this.batcher = new Batcher(
+      (items) => classifyBatch(this.sess, items, cfg, labels, thresholds),
+      maxBatch,
+      delayMs
+    );
   }
   static async create(bytes, cfg, labels, thresholds, opts) {
     const sess = await loadSession(bytes, {
@@ -280,11 +338,18 @@ var DirectImpl = class _DirectImpl {
       numThreads: opts.numThreads,
       backend: opts.backend
     });
-    return new _DirectImpl(sess, cfg, labels, thresholds);
+    return new _DirectImpl(
+      sess,
+      cfg,
+      labels,
+      thresholds,
+      opts.maxBatch ?? DEFAULT_MAX_BATCH,
+      opts.batchDelayMs ?? DEFAULT_BATCH_DELAY_MS
+    );
   }
   async classify(source) {
     const px = await toPixelData(source);
-    return classifyImageData(this.sess, px, this.cfg, this.labels, this.thresholds);
+    return this.batcher.submit(px);
   }
   dispose() {
     try {
@@ -294,27 +359,32 @@ var DirectImpl = class _DirectImpl {
   }
 };
 var WorkerImpl = class _WorkerImpl {
-  constructor(worker) {
+  constructor(worker, maxBatch, delayMs) {
     this.worker = worker;
     this.seq = 0;
     this.pending = /* @__PURE__ */ new Map();
     this.worker.onmessage = (e) => {
-      const { reqId, ok, result, error } = e.data || {};
-      const p = this.pending.get(reqId);
+      const data = e.data || {};
+      const p = this.pending.get(data.reqId);
       if (!p) return;
-      this.pending.delete(reqId);
-      if (ok) p.resolve(result);
-      else p.reject(new Error(error || "worker error"));
+      this.pending.delete(data.reqId);
+      if (data.ok) p.resolve(data);
+      else p.reject(new Error(data.error || "worker error"));
     };
     this.worker.onerror = (e) => {
       const err = new Error(e.message || "worker crashed");
       for (const p of this.pending.values()) p.reject(err);
       this.pending.clear();
     };
+    this.batcher = new Batcher((items) => this.runBatch(items), maxBatch, delayMs);
   }
   static async create(bytes, cfg, labels, thresholds, opts) {
     const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-    const impl = new _WorkerImpl(worker);
+    const impl = new _WorkerImpl(
+      worker,
+      opts.maxBatch ?? DEFAULT_MAX_BATCH,
+      opts.batchDelayMs ?? DEFAULT_BATCH_DELAY_MS
+    );
     const buf = bytes.buffer.slice(
       bytes.byteOffset,
       bytes.byteOffset + bytes.byteLength
@@ -339,9 +409,15 @@ var WorkerImpl = class _WorkerImpl {
       this.worker.postMessage({ type, reqId, ...data }, transfer);
     });
   }
+  async runBatch(items) {
+    const transfer = items.map((p) => p.data.buffer);
+    const resp = await this.rpc("classifyBatch", { payloads: items }, transfer);
+    if (!resp.results) throw new Error("@pixagram/nsfw: worker returned no batch results");
+    return resp.results;
+  }
   async classify(source) {
     const px = await toPixelData(source);
-    return this.rpc("classify", { payload: px }, [px.data.buffer]);
+    return this.batcher.submit(px);
   }
   dispose() {
     this.worker.terminate();

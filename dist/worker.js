@@ -176,6 +176,42 @@ async function classifyImageData(sess, px, cfg2, labels2, thresholds2) {
   const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
   return { ...decoded, ms: Math.round(now() - tStart), backend };
 }
+async function classifyBatch(sess, pxs, cfg2, labels2, thresholds2) {
+  const tStart = now();
+  const n = pxs.length;
+  if (n === 0) return [];
+  const S = cfg2.size;
+  const stride = 3 * S * S;
+  const data = new Float32Array(n * stride);
+  for (let i = 0; i < n; i++) {
+    const rgba = resizeToSquare(pxs[i], cfg2);
+    data.set(toTensorData(rgba, cfg2), i * stride);
+  }
+  const tensor = new ort.Tensor("float32", data, [n, 3, S, S]);
+  const feeds = {};
+  feeds[sess.inputName] = tensor;
+  const out = await sess.session.run(feeds);
+  const output = out[sess.outputName];
+  if (!output) throw new Error("@pixagram/nsfw: missing model output");
+  const all = output.data;
+  const classesPerRow = Math.floor(all.length / n);
+  const simd = (() => {
+    try {
+      return ort.env.wasm.simd ? "+simd" : "";
+    } catch {
+      return "";
+    }
+  })();
+  const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
+  const ms = Math.round(now() - tStart);
+  const results = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const logits = all.subarray(i * classesPerRow, (i + 1) * classesPerRow);
+    const decoded = decode(logits, labels2, thresholds2);
+    results[i] = { ...decoded, ms, backend };
+  }
+  return results;
+}
 
 // src/worker.ts
 var ctx = self;
@@ -200,6 +236,12 @@ ctx.onmessage = (event) => {
         if (!session || !cfg) throw new Error("worker not initialized");
         const result = await classifyImageData(session, msg.payload, cfg, labels, thresholds);
         ctx.postMessage({ reqId, ok: true, result });
+        return;
+      }
+      if (msg.type === "classifyBatch") {
+        if (!session || !cfg) throw new Error("worker not initialized");
+        const results = await classifyBatch(session, msg.payloads, cfg, labels, thresholds);
+        ctx.postMessage({ reqId, ok: true, results });
         return;
       }
     } catch (err) {

@@ -277,3 +277,57 @@ export async function classifyImageData(
 
   return { ...decoded, ms: Math.round(now() - tStart), backend };
 }
+
+/**
+ * Classify N images in a SINGLE inference. Each is preprocessed to [3,S,S] and
+ * stacked into an [N,3,S,S] batch, so the (expensive) GPU upload / kernel launch
+ * / readback is paid once for the whole batch instead of per image. The model's
+ * batch axis is dynamic (see export), so any N works. Returns one result per
+ * input, in order; `ms` is the wall time of the whole batched run.
+ */
+export async function classifyBatch(
+  sess: Session,
+  pxs: PixelData[],
+  cfg: PreprocessConfig,
+  labels: string[],
+  thresholds: Thresholds
+): Promise<NsfwResult[]> {
+  const tStart = now();
+  const n = pxs.length;
+  if (n === 0) return [];
+
+  const S = cfg.size;
+  const stride = 3 * S * S; // floats per image (NCHW)
+  const data = new Float32Array(n * stride);
+  for (let i = 0; i < n; i++) {
+    const rgba = resizeToSquare(pxs[i]!, cfg);
+    data.set(toTensorData(rgba, cfg), i * stride);
+  }
+
+  const tensor = new ort.Tensor("float32", data, [n, 3, S, S]);
+  const feeds: Record<string, ort.Tensor> = {};
+  feeds[sess.inputName] = tensor;
+  const out = await sess.session.run(feeds);
+  const output = out[sess.outputName];
+  if (!output) throw new Error("@pixagram/nsfw: missing model output");
+
+  const all = output.data as Float32Array;
+  const classesPerRow = Math.floor(all.length / n); // e.g. 5
+  const simd = (() => {
+    try {
+      return ort.env.wasm.simd ? "+simd" : "";
+    } catch {
+      return "";
+    }
+  })();
+  const backend = sess.backend === "wasm" ? "wasm" + simd : sess.backend;
+  const ms = Math.round(now() - tStart);
+
+  const results: NsfwResult[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const logits = all.subarray(i * classesPerRow, (i + 1) * classesPerRow);
+    const decoded = decode(logits, labels, thresholds);
+    results[i] = { ...decoded, ms, backend };
+  }
+  return results;
+}

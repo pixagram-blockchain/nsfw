@@ -7,9 +7,11 @@
  * carry raw pixels (the worker has no DOM to decode images itself).
  *
  * Protocol (request/response keyed by reqId):
- *   init:     { reqId, modelBuffer: ArrayBuffer, cfg, labels, thresholds, opts }
- *   classify: { reqId, payload: { data, width, height } }
- *   ->        { reqId, ok: true, result } | { reqId, ok: false, error }
+ *   init:         { reqId, modelBuffer: ArrayBuffer, cfg, labels, thresholds, opts }
+ *   classify:     { reqId, payload: { data, width, height } }
+ *   classifyBatch:{ reqId, payloads: [{ data, width, height }, ...] }
+ *   ->            { reqId, ok: true, result } | { reqId, ok: true, results: [...] }
+ *                 | { reqId, ok: false, error }
  */
 import * as core from "./core.js";
 import type { PreprocessConfig, Thresholds } from "./types.js";
@@ -44,6 +46,13 @@ ctx.onmessage = (event: MessageEvent) => {
         if (!session || !cfg) throw new Error("worker not initialized");
         const result = await core.classifyImageData(session, msg.payload, cfg, labels, thresholds);
         ctx.postMessage({ reqId, ok: true, result });
+        return;
+      }
+
+      if (msg.type === "classifyBatch") {
+        if (!session || !cfg) throw new Error("worker not initialized");
+        const results = await core.classifyBatch(session, msg.payloads, cfg, labels, thresholds);
+        ctx.postMessage({ reqId, ok: true, results });
         return;
       }
     } catch (err) {
